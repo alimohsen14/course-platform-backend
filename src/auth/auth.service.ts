@@ -6,137 +6,195 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
-import { SignupDto } from './dto/signup.dto';
-import { LoginDto } from './dto/login.dto';
 import * as bcrypt from 'bcrypt';
+import axios from 'axios';
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
+
+interface GoogleTokenResponse {
+  access_token: string;
+}
+interface GoogleUserInfo {
+  id: string;
+  email: string;
+  name: string;
+}
 
 @Injectable()
 export class AuthService {
   constructor(
     private prisma: PrismaService,
     private jwt: JwtService,
+    private config: ConfigService,
   ) {}
 
-  generateAccessToken(user: any) {
-    return this.jwt.sign({
-      sub: user.id,
-      email: user.email,
+  // --------------------------
+  // TOKEN CREATION
+  // --------------------------
+  generateTokens(userId: string, email: string) {
+    const accessToken = this.jwt.sign(
+      { sub: userId, email },
+      { expiresIn: '15m' },
+    );
+    const refreshToken = this.jwt.sign(
+      { sub: userId, email },
+      { expiresIn: '7d' },
+    );
+    return { accessToken, refreshToken };
+  }
+
+  async updateRefreshToken(id: string, refresh: string) {
+    await this.prisma.user.update({
+      where: { id },
+      data: { refreshToken: refresh },
     });
   }
 
-  generateRefreshToken(user: any) {
-    return this.jwt.sign(
-      {
-        sub: user.id,
-        email: user.email,
-      },
-      {
-        expiresIn: '7d',
-      },
-    );
-  }
-
-  async signup(dto: SignupDto) {
+  // --------------------------
+  // SIGNUP
+  // --------------------------
+  async signup(dto: any) {
     const exists = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
-
-    if (exists) {
-      throw new BadRequestException('Email already exists');
-    }
+    if (exists) throw new BadRequestException('Email already exists');
 
     const hashed = await bcrypt.hash(dto.password, 10);
 
     const user = await this.prisma.user.create({
       data: {
-        name: dto.name,
         email: dto.email,
-        password: hashed,
+        name: dto.name,
         phone: dto.phone,
+        password: hashed,
+        provider: 'LOCAL',
       },
     });
 
-    const accessToken = this.generateAccessToken(user);
-    const refreshToken = this.generateRefreshToken(user);
+    const tokens = this.generateTokens(user.id, user.email);
+    await this.updateRefreshToken(user.id, tokens.refreshToken);
 
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: { refreshToken },
-    });
-
-    return {
-      message: 'User created successfully',
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-      },
-    };
+    return { message: 'User created', ...tokens, user };
   }
 
-  async login(dto: LoginDto) {
+  // --------------------------
+  // LOGIN
+  // --------------------------
+  async login(dto: any) {
     const user = await this.prisma.user.findUnique({
       where: { email: dto.email },
     });
 
-    if (!user) {
-      throw new NotFoundException('Email or password is incorrect');
-    }
+    if (!user) throw new NotFoundException('Email or password incorrect');
+    if (!user.password && user.provider === 'GOOGLE')
+      throw new BadRequestException('Login with Google');
 
-    const match = await bcrypt.compare(dto.password, user.password);
-    if (!match) {
-      throw new BadRequestException('Email or password is incorrect');
-    }
+    const match = await bcrypt.compare(dto.password, user.password || '');
+    if (!match) throw new BadRequestException('Email or password incorrect');
 
-    const accessToken = this.generateAccessToken(user);
-    const refreshToken = this.generateRefreshToken(user);
+    const tokens = this.generateTokens(user.id, user.email);
+    await this.updateRefreshToken(user.id, tokens.refreshToken);
 
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: { refreshToken },
-    });
-
-    return {
-      message: 'Logged in successfully',
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-      },
-    };
+    return { message: 'Logged in', ...tokens, user };
   }
 
-  async refresh(token: string) {
-    try {
-      const payload = this.jwt.verify(token);
+  // --------------------------
+  // GET PROFILE
+  // --------------------------
+  async getProfile(id: string) {
+    return this.prisma.user.findUnique({ where: { id } });
+  }
 
+  // --------------------------
+  // GOOGLE LOGIN
+  // --------------------------
+  async googleLogin(code: string) {
+    const client_id = this.config.get('GOOGLE_CLIENT_ID');
+    const client_secret = this.config.get('GOOGLE_CLIENT_SECRET');
+    const redirect_uri = this.config.get('GOOGLE_REDIRECT_URI');
+
+    const tokenRes = await axios.post<GoogleTokenResponse>(
+      'https://oauth2.googleapis.com/token',
+      new URLSearchParams({
+        client_id,
+        client_secret,
+        redirect_uri,
+        grant_type: 'authorization_code',
+        code,
+      }),
+    );
+
+    const { access_token } = tokenRes.data;
+    if (!access_token) throw new BadRequestException('Google login failed');
+
+    const userInfo = await axios.get<GoogleUserInfo>(
+      'https://www.googleapis.com/oauth2/v2/userinfo',
+      { headers: { Authorization: `Bearer ${access_token}` } },
+    );
+
+    const { email, name, id: providerId } = userInfo.data;
+
+    const exists = await this.prisma.user.findUnique({ where: { email } });
+
+    if (!exists) {
+      return {
+        isNewUser: true,
+        user: { email, name, providerId },
+        tokens: null,
+      };
+    }
+
+    const tokens = this.generateTokens(exists.id, exists.email);
+    await this.updateRefreshToken(exists.id, tokens.refreshToken);
+
+    return { isNewUser: false, user: exists, tokens };
+  }
+
+  // --------------------------
+  // COMPLETE GOOGLE SIGNUP
+  // --------------------------
+  async googleCompleteSignup(dto: any) {
+    const { email, name, phone, providerId } = dto;
+
+    const exists = await this.prisma.user.findUnique({ where: { email } });
+    if (exists) throw new BadRequestException('User already exists');
+
+    const user = await this.prisma.user.create({
+      data: {
+        email,
+        name,
+        phone,
+        password: null,
+        provider: 'GOOGLE',
+        providerId,
+      },
+    });
+
+    const tokens = this.generateTokens(user.id, user.email);
+    await this.updateRefreshToken(user.id, tokens.refreshToken);
+
+    return { message: 'Google signup done', ...tokens, user };
+  }
+
+  // --------------------------
+  // REFRESH TOKEN
+  // --------------------------
+  async refresh(refreshToken: string) {
+    try {
+      const payload = this.jwt.verify(refreshToken);
       const user = await this.prisma.user.findUnique({
         where: { id: payload.sub },
       });
 
-      if (!user || user.refreshToken !== token) {
-        throw new ForbiddenException('Invalid refresh token');
-      }
+      if (!user || user.refreshToken !== refreshToken)
+        throw new ForbiddenException('Invalid refresh');
 
-      const newAccessToken = this.generateAccessToken(user);
-      const newRefreshToken = this.generateRefreshToken(user);
+      const tokens = this.generateTokens(user.id, user.email);
+      await this.updateRefreshToken(user.id, tokens.refreshToken);
 
-      await this.prisma.user.update({
-        where: { id: user.id },
-        data: { refreshToken: newRefreshToken },
-      });
-
-      return {
-        accessToken: newAccessToken,
-        refreshToken: newRefreshToken,
-      };
-    } catch (e) {
-      throw new ForbiddenException('Invalid refresh token');
+      return tokens;
+    } catch {
+      throw new ForbiddenException('Invalid refresh');
     }
   }
 }
