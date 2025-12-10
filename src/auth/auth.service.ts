@@ -104,6 +104,63 @@ export class AuthService {
   async getProfile(id: string) {
     return this.prisma.user.findUnique({ where: { id } });
   }
+  // --------------------------
+  // UPDATE PROFILE
+  // --------------------------
+  async updateProfile(userId: string, data: { name?: string; phone?: string }) {
+    const updatedUser = await this.prisma.user.update({
+      where: { id: userId },
+      data,
+    });
+
+    return {
+      message: 'Profile updated successfully',
+      user: updatedUser,
+    };
+  }
+  // --------------------------
+  // CHANGE PASSWORD
+  // --------------------------
+  async changePassword(
+    userId: string,
+    dto: { currentPassword: string; newPassword: string },
+  ) {
+    const { currentPassword, newPassword } = dto;
+
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    if (!user.password || user.provider === 'GOOGLE') {
+      throw new BadRequestException(
+        'Password change is only available for email/password accounts',
+      );
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      throw new BadRequestException('Current password is incorrect');
+    }
+
+    if (!newPassword || newPassword.length < 6) {
+      throw new BadRequestException(
+        'New password must be at least 6 characters long',
+      );
+    }
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { password: hashed },
+    });
+
+    return {
+      message: 'Password updated successfully',
+    };
+  }
 
   // --------------------------
   // GOOGLE LOGIN

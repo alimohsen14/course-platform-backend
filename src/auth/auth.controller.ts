@@ -8,6 +8,7 @@ import {
   UseGuards,
   Query,
   Res,
+  Patch,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
@@ -40,6 +41,20 @@ export class AuthController {
   @Get('profile')
   getProfile(@Req() req) {
     return this.authService.getProfile(req.user.id);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Patch('profile')
+  updateProfile(@Req() req, @Body() body: { name?: string; phone?: string }) {
+    return this.authService.updateProfile(req.user.id, body);
+  }
+  @UseGuards(JwtAuthGuard)
+  @Post('change-password')
+  changePassword(
+    @Req() req,
+    @Body() body: { currentPassword: string; newPassword: string },
+  ) {
+    return this.authService.changePassword(req.user.id, body);
   }
 
   @Post('refresh')
